@@ -1,4 +1,6 @@
 import SwiftUI
+import CoreGraphics
+import ApplicationServices
 
 @MainActor
 class SwitcherController: ObservableObject {
@@ -6,18 +8,31 @@ class SwitcherController: ObservableObject {
     @Published var countdown: Int = 0
     @Published var lastTabCount: Int = 0
     @Published var switchCount: Int = 0
+    @Published var isAccessibilityGranted: Bool = false
 
     private var switchTask: Task<Void, Never>?
 
+    init() {
+        isAccessibilityGranted = AXIsProcessTrusted()
+    }
+
+    func requestAccessibility() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        isAccessibilityGranted = AXIsProcessTrustedWithOptions(options)
+    }
+
+    func recheckAccessibility() {
+        isAccessibilityGranted = AXIsProcessTrusted()
+    }
+
     func start() {
-        guard !isRunning else { return }
+        recheckAccessibility()
+        guard isAccessibilityGranted, !isRunning else { return }
         isRunning = true
         switchCount = 0
         switchTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                // Match original: random.randint(1,6) then range(1, n) = 0..5 tabs
-                // Using 1..5 so at least one tab is always pressed
                 let tabCount = Int.random(in: 1...5)
                 self.lastTabCount = tabCount
                 self.switchCount += 1
@@ -42,28 +57,36 @@ class SwitcherController: ObservableObject {
     }
 
     private func performCmdTab(tabCount: Int) async {
-        var script = "tell application \"System Events\"\n    key down command\n"
-        for _ in 0..<tabCount {
-            script += "    keystroke tab\n"
-        }
-        script += "    key up command\nend tell"
+        await Task.detached(priority: .userInitiated) {
+            let src = CGEventSource(stateID: .hidSystemState)
+            let cmdKey: CGKeyCode = 0x37  // left Command
+            let tabKey: CGKeyCode = 0x30  // Tab
 
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", script]
-            process.terminationHandler = { _ in continuation.resume() }
-            do {
-                try process.run()
-            } catch {
-                continuation.resume()
+            // Command down
+            let cmdDown = CGEvent(keyboardEventSource: src, virtualKey: cmdKey, keyDown: true)
+            cmdDown?.flags = .maskCommand
+            cmdDown?.post(tap: .cgSessionEventTap)
+
+            for _ in 0..<tabCount {
+                let tabDown = CGEvent(keyboardEventSource: src, virtualKey: tabKey, keyDown: true)
+                tabDown?.flags = .maskCommand
+                tabDown?.post(tap: .cgSessionEventTap)
+
+                let tabUp = CGEvent(keyboardEventSource: src, virtualKey: tabKey, keyDown: false)
+                tabUp?.flags = .maskCommand
+                tabUp?.post(tap: .cgSessionEventTap)
             }
-        }
+
+            // Command up
+            let cmdUp = CGEvent(keyboardEventSource: src, virtualKey: cmdKey, keyDown: false)
+            cmdUp?.flags = []
+            cmdUp?.post(tap: .cgSessionEventTap)
+        }.value
     }
 }
 
 struct ContentView: View {
-    @StateObject private var controller = SwitcherController()
+    @EnvironmentObject private var controller: SwitcherController
 
     var body: some View {
         VStack(spacing: 20) {
@@ -71,12 +94,39 @@ struct ContentView: View {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            statusSection
+            if !controller.isAccessibilityGranted {
+                accessibilityWarning
+            } else {
+                statusSection
+            }
 
             controlButtons
         }
         .padding(32)
         .frame(minWidth: 300)
+        .onAppear { controller.recheckAccessibility() }
+    }
+
+    private var accessibilityWarning: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "lock.shield")
+                .font(.largeTitle)
+                .foregroundStyle(.orange)
+            Text("Accessibility Access Required")
+                .fontWeight(.medium)
+            Text("Grant access in System Settings to simulate keystrokes.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Grant Access…") {
+                controller.requestAccessibility()
+                // Open System Settings to Accessibility pane
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.top, 4)
+        }
+        .frame(minHeight: 50)
     }
 
     @ViewBuilder
@@ -109,24 +159,36 @@ struct ContentView: View {
     }
 
     private var controlButtons: some View {
-        HStack(spacing: 12) {
-            Button("Start") {
-                controller.start()
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(controller.isRunning)
-            .keyboardShortcut("s", modifiers: [])
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                Button("Start") {
+                    controller.start()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(controller.isRunning)
+                .keyboardShortcut("s", modifiers: [])
 
-            Button("Stop") {
-                controller.stop()
+                Button("Stop") {
+                    controller.stop()
+                }
+                .buttonStyle(.bordered)
+                .disabled(!controller.isRunning)
+                .keyboardShortcut(.escape, modifiers: [])
             }
-            .buttonStyle(.bordered)
-            .disabled(!controller.isRunning)
-            .keyboardShortcut(.escape, modifiers: [])
+
+            Divider()
+
+            Button("Quit") {
+                NSApplication.shared.terminate(nil)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .font(.caption)
         }
     }
 }
 
 #Preview {
     ContentView()
+        .environmentObject(SwitcherController())
 }
